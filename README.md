@@ -101,6 +101,15 @@ A worktree is skipped when any of these is true.
 - Git has it locked.
 - It is on a detached `HEAD` holding commits that no other ref contains.
 
+Git occasionally loses track of a worktree: its `.git` file goes missing, or
+the directory is a leftover shell that was never a checkout at all. The script
+reports that as an orphan directory and removes it with `rm -rf`, since there
+is no worktree for git to remove. The first two checks above still apply, and
+so does the `--include-unknown` rule below, but the last three cannot — git
+will not report changes, locks or commits for a directory it does not track.
+So an orphan directory is removed whole, and anything in it that was never
+committed goes with it.
+
 **Removing a worktree never deletes its branch.** Committed work on a named
 branch stays reachable and you can check it out again anywhere. The script
 reports how far a branch is ahead of your default branch, but does not treat
