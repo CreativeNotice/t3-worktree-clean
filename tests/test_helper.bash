@@ -5,7 +5,9 @@
 # Every test builds a throwaway T3_ROOT: a worktree root, a state database
 # with the one table the script reads, and whatever checkouts the case needs.
 
-SCRIPT="$BATS_TEST_DIRNAME/../t3-worktree-clean"
+# T3WC_SCRIPT replays the suite against another build of the script, which is
+# how a case is shown red against the revision that had the bug.
+SCRIPT="${T3WC_SCRIPT:-$BATS_TEST_DIRNAME/../t3-worktree-clean}"
 
 # Build an empty T3 root and export T3_ROOT so the script points at it.
 setup_t3() {

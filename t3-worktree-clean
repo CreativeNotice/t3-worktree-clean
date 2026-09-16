@@ -190,10 +190,15 @@ for project_dir in "$WORKTREE_ROOT"/*/; do
     title="${info#*|}"
     [ -n "$title" ] || title="${C_DIM}(no thread record)${C_OFF}"
 
+    # The guard chain runs for every worktree, including one git does not
+    # recognise, where the probes that set these never run. Each default is
+    # load-bearing: it has to be the value that keeps its own guard quiet. A
+    # probe whose safe default is not the quiet one needs its own arm on the
+    # orphan path rather than a default here.
     verdict=""
     reason=""
     is_orphan=0
-    orphan_commits=0
+    unreachable_commits=0
     dirty=0
     locked=0
     detached=0
@@ -223,13 +228,12 @@ for project_dir in "$WORKTREE_ROOT"/*/; do
       detached=0
       git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1 || detached=1
 
-      orphan_commits=0
+      unreachable_commits=0
       if [ "$detached" -eq 1 ]; then
         if [ -z "$(git -C "$wt" for-each-ref --contains HEAD --count=1 --format='%(refname)' 2>/dev/null)" ]; then
-          orphan_commits=1
+          unreachable_commits=1
         fi
       fi
-
     fi
 
     # Ordered by severity: the first match is the reason reported. The chain
@@ -244,7 +248,7 @@ for project_dir in "$WORKTREE_ROOT"/*/; do
       verdict="skip"; reason="$dirty uncommitted change(s)"
     elif [ "$locked" -eq 1 ]; then
       verdict="skip"; reason="git worktree is locked"
-    elif [ "$orphan_commits" -eq 1 ] && [ "$FORCE" -eq 0 ]; then
+    elif [ "$unreachable_commits" -eq 1 ] && [ "$FORCE" -eq 0 ]; then
       verdict="skip"; reason="detached HEAD, commits on no other ref"
     elif [ "$state" = "unknown" ] && [ "$INCLUDE_UNKNOWN" -eq 0 ]; then
       verdict="skip"; reason="no thread record (--include-unknown)"
@@ -271,7 +275,7 @@ for project_dir in "$WORKTREE_ROOT"/*/; do
           reason="$state; branch $branch kept ($ahead commit(s) not in $base)"
         fi
       fi
-      if [ "$orphan_commits" -eq 1 ]; then
+      if [ "$unreachable_commits" -eq 1 ]; then
         reason="$reason; FORCED, detached commits will be lost"
       fi
     fi
@@ -283,7 +287,7 @@ for project_dir in "$WORKTREE_ROOT"/*/; do
       N_REMOVE=$((N_REMOVE + 1))
       REMOVE_KB=$((REMOVE_KB + size_kb))
       colour="$C_GRN"
-      [ "$orphan_commits" -eq 1 ] && colour="$C_RED"
+      [ "$unreachable_commits" -eq 1 ] && colour="$C_RED"
     else
       N_SKIP=$((N_SKIP + 1))
       colour="$C_YEL"

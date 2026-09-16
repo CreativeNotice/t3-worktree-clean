@@ -31,6 +31,27 @@ setup() {
   [[ "$output" == *"skip"*"you are standing in it"* ]]
 }
 
+# SELF_WT resolves to the innermost repo, which is not necessarily the worktree
+# under consideration. The physical-path check is what catches this.
+@test "guards: standing in a nested repo inside a worktree still skips it" {
+  local wt; wt=$(make_worktree proj t3code-here)
+  add_thread proj t3code-here archived "archived thread"
+
+  # Keep the checkout clean, so the skip cannot come from the dirty guard.
+  printf 'vendor/\n' >"$wt/.gitignore"
+  git -C "$wt" add .gitignore
+  git -C "$wt" -c user.email=t@example.com -c user.name=t \
+    commit -q -m "ignore vendor"
+  mkdir -p "$wt/vendor/inner"
+  git -C "$wt/vendor/inner" init -q -b main
+
+  cd "$wt/vendor/inner"
+  run "$SCRIPT" --apply
+
+  [ -d "$wt" ]
+  [[ "$output" == *"skip"*"you are standing in it"* ]]
+}
+
 @test "guards: uncommitted changes are skipped" {
   local wt; wt=$(make_worktree proj t3code-dirty)
   add_thread proj t3code-dirty archived "archived thread"

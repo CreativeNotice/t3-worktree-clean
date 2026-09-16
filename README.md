@@ -93,22 +93,28 @@ T3's state.
 
 ## What it will not touch
 
-A worktree is skipped when any of these is true.
+A worktree is skipped when any of these is true. These three are checked for
+every directory under the worktree root, whatever state it is in.
 
 - Its thread is still active.
-- It is the worktree you are standing in.
+- It is the worktree you are standing in, or you are somewhere inside it.
+- It has no thread record at all, unless you pass `--include-unknown`.
+
+These three need git to recognise the worktree, and are checked whenever it
+does.
+
 - It has uncommitted or untracked changes.
 - Git has it locked.
 - It is on a detached `HEAD` holding commits that no other ref contains.
 
-Git occasionally loses track of a worktree: its `.git` file goes missing, or
-the directory is a leftover shell that was never a checkout at all. The script
-reports that as an orphan directory and removes it with `rm -rf`, since there
-is no worktree for git to remove. The first two checks above still apply, and
-so does the `--include-unknown` rule below, but the last three cannot — git
-will not report changes, locks or commits for a directory it does not track.
-So an orphan directory is removed whole, and anything in it that was never
-committed goes with it.
+That split matters because git occasionally loses track of a worktree: its
+`.git` file goes missing, or the directory is a leftover shell that was never
+a checkout at all. The script calls that an orphan directory and removes it
+with `rm -rf`, since there is no worktree for git to remove — but only once
+the first three checks have passed. The second three cannot be made at all,
+because git will not report changes, locks or commits for a directory it does
+not track. So an orphan directory is removed whole, and anything in it that
+was never committed goes with it.
 
 **Removing a worktree never deletes its branch.** Committed work on a named
 branch stays reachable and you can check it out again anywhere. The script
