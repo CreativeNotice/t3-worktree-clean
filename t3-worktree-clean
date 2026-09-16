@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+#
+# t3-worktree-clean - remove git worktrees left behind by T3 Code.
+#
+# T3 creates a worktree per thread under ~/.t3/worktrees/<project>/t3code-<id>/
+# but does not remove it when the thread is archived or deleted. Each one can
+# carry a full node_modules, so they add up fast.
+#
+# A worktree is a candidate for removal when its thread is archived or deleted
+# in T3's state database and the checkout holds nothing that removal would
+# lose. Removing a worktree never deletes its branch, so committed work on a
+# named branch survives. Dry run by default; pass --apply to act.
+
+set -uo pipefail
+
+T3_ROOT="${T3_ROOT:-$HOME/.t3}"
+WORKTREE_ROOT="$T3_ROOT/worktrees"
+STATE_DB="$T3_ROOT/userdata/state.sqlite"
+
+APPLY=0
+FORCE=0
+INCLUDE_UNKNOWN=0
+PROJECT_FILTER=""
+
+usage() {
+  cat <<'USAGE'
+Usage: t3-worktree-clean [options]
+
+Removes git worktrees left behind by archived or deleted T3 Code threads.
+Prints what it would do and exits unless --apply is given.
+
+Options:
+  --apply             Actually remove the worktrees (default is a dry run).
+  --project NAME      Limit to one project under ~/.t3/worktrees/.
+  --include-unknown   Also treat worktrees with no thread in T3's database
+                      as removable. Off by default: an unrecognised worktree
+                      may belong to a session this script cannot see.
+  --force             Remove even when detached-HEAD commits would become
+                      unreachable. Implies passing --force to git.
+  -h, --help          Show this help.
+
+A worktree is skipped when its thread is still active, when it is the
+worktree you are standing in, when it has uncommitted or untracked changes,
+when git has it locked, or when it is on a detached HEAD holding commits no
+other ref contains.
+
+Removing a worktree does not delete its branch. Commits on a named branch
+stay reachable and can be checked out again anywhere.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --force) FORCE=1 ;;
+    --include-unknown) INCLUDE_UNKNOWN=1 ;;
+    --project)
+      shift
+      [ $# -gt 0 ] || { echo "t3-worktree-clean: --project needs a name" >&2; exit 2; }
+      PROJECT_FILTER="$1"
+      ;;
+    --project=*) PROJECT_FILTER="${1#--project=}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "t3-worktree-clean: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [ -t 1 ]; then
+  C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YEL=$'\033[33m'
+  C_GRN=$'\033[32m'; C_BLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_DIM=""; C_RED=""; C_YEL=""; C_GRN=""; C_BLD=""; C_OFF=""
+fi
+
+[ -d "$WORKTREE_ROOT" ] || { echo "No T3 worktree root at $WORKTREE_ROOT"; exit 0; }
+
+HAVE_DB=1
+if [ ! -f "$STATE_DB" ] || ! command -v sqlite3 >/dev/null 2>&1; then
+  HAVE_DB=0
+  echo "${C_YEL}warning:${C_OFF} T3 state database unreadable; thread status unavailable." >&2
+  echo "         Every worktree will be reported as 'unknown'." >&2
+fi
+
+# Absolute path of the worktree we are standing in, so we never remove it.
+SELF_WT=""
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  SELF_WT=$(git rev-parse --show-toplevel 2>/dev/null)
+  [ -n "$SELF_WT" ] && SELF_WT=$(cd "$SELF_WT" 2>/dev/null && pwd -P)
+fi
+
+# Thread status for a worktree path, as "state|title".
+# Worst case wins: one active thread makes the whole path active.
+thread_info() {
+  local path="$1" escaped
+  [ "$HAVE_DB" -eq 1 ] || { printf 'unknown|'; return; }
+  escaped=$(printf '%s' "$path" | sed "s/'/''/g")
+  sqlite3 -readonly "file:${STATE_DB}?mode=ro" "
+    SELECT
+      CASE
+        WHEN SUM(CASE WHEN deleted_at IS NULL AND archived_at IS NULL THEN 1 ELSE 0 END) > 0
+          THEN 'active'
+        WHEN COUNT(*) = 0 THEN 'unknown'
+        WHEN SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) = COUNT(*)
+          THEN 'deleted'
+        ELSE 'archived'
+      END
+      || '|' ||
+      COALESCE(MAX(title), '')
+    FROM projection_threads
+    WHERE worktree_path = '${escaped}';" 2>/dev/null || printf 'unknown|'
+}
+
+human_size() {
+  local kb="$1"
+  if [ "$kb" -ge 1048576 ]; then
+    awk -v k="$kb" 'BEGIN { printf "%.1fG", k/1048576 }'
+  elif [ "$kb" -ge 1024 ]; then
+    awk -v k="$kb" 'BEGIN { printf "%dM", k/1024 }'
+  else
+    printf '%dK' "$kb"
+  fi
+}
+
+truncate_field() {
+  local s="$1" n="$2"
+  if [ "${#s}" -gt "$n" ]; then
+    printf '%s…' "${s:0:$((n - 1))}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+TOTAL_KB=0
+REMOVE_KB=0
+N_TOTAL=0
+N_REMOVE=0
+N_SKIP=0
+N_FAILED=0
+REMOVED_KB=0
+N_REMOVED=0
+TOUCHED_REPOS=""
+
+printf '%s%-18s %-34s %6s  %s%s\n' "$C_BLD" "WORKTREE" "THREAD" "SIZE" "VERDICT" "$C_OFF"
+
+for project_dir in "$WORKTREE_ROOT"/*/; do
+  [ -d "$project_dir" ] || continue
+  project=$(basename "$project_dir")
+  if [ -n "$PROJECT_FILTER" ] && [ "$project" != "$PROJECT_FILTER" ]; then
+    continue
+  fi
+
+  printf '%s%s%s\n' "$C_DIM" "$project" "$C_OFF"
+
+  for wt in "$project_dir"*/; do
+    [ -d "$wt" ] || continue
+    wt="${wt%/}"
+    name=$(basename "$wt")
+    N_TOTAL=$((N_TOTAL + 1))
+
+    # git reports resolved physical paths; compare against those, not a
+    # path that may run through a symlink such as /tmp -> /private/tmp.
+    wt_real=$(cd "$wt" 2>/dev/null && pwd -P) || wt_real="$wt"
+    [ -n "$wt_real" ] || wt_real="$wt"
+
+    size_kb=$(du -sk "$wt" 2>/dev/null | awk '{print $1}')
+    [ -n "$size_kb" ] || size_kb=0
+    TOTAL_KB=$((TOTAL_KB + size_kb))
+
+    info=$(thread_info "$wt")
+    state="${info%%|*}"
+    title="${info#*|}"
+    [ -n "$title" ] || title="${C_DIM}(no thread record)${C_OFF}"
+
+    verdict=""
+    reason=""
+    is_orphan=0
+    orphan_commits=0
+    dirty=0
+    locked=0
+    detached=0
+    main_repo=""
+
+    if ! git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      # Directory is there but git does not know it: a leftover shell.
+      is_orphan=1
+      verdict="remove"
+      reason="orphan directory, not a git worktree"
+    fi
+
+    if [ "$is_orphan" -eq 0 ]; then
+      common_dir=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+      main_repo=$(dirname "$common_dir")
+
+      locked=0
+      if git -C "$main_repo" worktree list --porcelain 2>/dev/null \
+           | awk -v target="$wt_real" '
+               $1 == "worktree" { cur = substr($0, 10) }
+               $1 == "locked" && cur == target { found = 1 }
+               END { exit(found ? 0 : 1) }'; then
+        locked=1
+      fi
+
+      dirty=$(git -C "$wt" status --porcelain 2>/dev/null | head -200 | wc -l | tr -d ' ')
+
+      detached=0
+      git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1 || detached=1
+
+      orphan_commits=0
+      if [ "$detached" -eq 1 ]; then
+        if [ -z "$(git -C "$wt" for-each-ref --contains HEAD --count=1 --format='%(refname)' 2>/dev/null)" ]; then
+          orphan_commits=1
+        fi
+      fi
+
+      # Ordered by severity: the first match is the reason reported.
+      if [ -n "$SELF_WT" ] && [ "$wt_real" = "$SELF_WT" ]; then
+        verdict="skip"; reason="you are standing in it"
+      elif [ "$state" = "active" ]; then
+        verdict="skip"; reason="thread still active"
+      elif [ "$dirty" -gt 0 ]; then
+        verdict="skip"; reason="$dirty uncommitted change(s)"
+      elif [ "$locked" -eq 1 ]; then
+        verdict="skip"; reason="git worktree is locked"
+      elif [ "$orphan_commits" -eq 1 ] && [ "$FORCE" -eq 0 ]; then
+        verdict="skip"; reason="detached HEAD, commits on no other ref"
+      elif [ "$state" = "unknown" ] && [ "$INCLUDE_UNKNOWN" -eq 0 ]; then
+        verdict="skip"; reason="no thread record (--include-unknown)"
+      else
+        verdict="remove"
+        reason="$state"
+        if [ "$detached" -eq 0 ]; then
+          branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
+          base=$(git -C "$wt" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null)
+          base="${base#origin/}"
+          if [ -z "$base" ]; then
+            for candidate in main master; do
+              if git -C "$wt" rev-parse --verify -q "$candidate" >/dev/null 2>&1; then
+                base="$candidate"; break
+              fi
+            done
+          fi
+          ahead=""
+          [ -n "$base" ] && ahead=$(git -C "$wt" rev-list --count "${base}..HEAD" 2>/dev/null)
+          if [ -n "$ahead" ] && [ "$ahead" -gt 0 ] 2>/dev/null; then
+            reason="$state; branch $branch kept ($ahead commit(s) not in $base)"
+          fi
+        fi
+        if [ "$orphan_commits" -eq 1 ]; then
+          reason="$reason; FORCED, detached commits will be lost"
+        fi
+      fi
+    fi
+
+    disp_title=$(truncate_field "$title" 34)
+    disp_size=$(human_size "$size_kb")
+
+    if [ "$verdict" = "remove" ]; then
+      N_REMOVE=$((N_REMOVE + 1))
+      REMOVE_KB=$((REMOVE_KB + size_kb))
+      colour="$C_GRN"
+      [ "$orphan_commits" -eq 1 ] && colour="$C_RED"
+    else
+      N_SKIP=$((N_SKIP + 1))
+      colour="$C_YEL"
+    fi
+
+    printf '  %-18s %-34s %6s  %s%s%s %s%s%s\n' \
+      "$name" "$disp_title" "$disp_size" \
+      "$colour" "$verdict" "$C_OFF" "$C_DIM" "$reason" "$C_OFF"
+
+    if [ "$APPLY" -eq 1 ] && [ "$verdict" = "remove" ]; then
+      ok=0
+      if [ "$is_orphan" -eq 1 ]; then
+        rm -rf "$wt" && ok=1
+      else
+        if [ "$FORCE" -eq 1 ]; then
+          git -C "$main_repo" worktree remove --force "$wt" >/dev/null 2>&1 && ok=1
+        else
+          git -C "$main_repo" worktree remove "$wt" >/dev/null 2>&1 && ok=1
+        fi
+        # git refuses over ignored build output it did not create; the
+        # checkout is clean by the test above, so fall back to the filesystem.
+        if [ "$ok" -eq 0 ]; then
+          rm -rf "$wt" && ok=1
+        fi
+        case " $TOUCHED_REPOS " in
+          *" $main_repo "*) ;;
+          *) TOUCHED_REPOS="$TOUCHED_REPOS $main_repo" ;;
+        esac
+      fi
+
+      if [ "$ok" -eq 1 ]; then
+        N_REMOVED=$((N_REMOVED + 1))
+        REMOVED_KB=$((REMOVED_KB + size_kb))
+      else
+        N_FAILED=$((N_FAILED + 1))
+        printf '  %-18s %s! removal failed%s\n' "" "$C_RED" "$C_OFF"
+      fi
+    fi
+  done
+done
+
+for repo in $TOUCHED_REPOS; do
+  git -C "$repo" worktree prune >/dev/null 2>&1
+done
+
+echo
+if [ "$APPLY" -eq 1 ]; then
+  printf '%sRemoved %d of %d worktree(s), reclaimed %s.%s' \
+    "$C_BLD" "$N_REMOVED" "$N_TOTAL" "$(human_size "$REMOVED_KB")" "$C_OFF"
+  [ "$N_FAILED" -gt 0 ] && printf ' %s%d failed.%s' "$C_RED" "$N_FAILED" "$C_OFF"
+  printf ' %d kept.\n' "$N_SKIP"
+else
+  printf '%s%d removable, %s reclaimable; %d kept.%s\n' \
+    "$C_BLD" "$N_REMOVE" "$(human_size "$REMOVE_KB")" "$N_SKIP" "$C_OFF"
+  printf '%sDry run. Re-run with --apply to remove them.%s\n' "$C_DIM" "$C_OFF"
+fi
