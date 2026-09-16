@@ -44,6 +44,10 @@ worktree you are standing in, when it has uncommitted or untracked changes,
 when git has it locked, or when it is on a detached HEAD holding commits no
 other ref contains.
 
+A directory git no longer recognises is still held by the first two of those
+and by --include-unknown, but git cannot report changes, locks or commits for
+it, so the rest cannot be checked.
+
 Removing a worktree does not delete its branch. Commits on a named branch
 stay reachable and can be checked out again anywhere.
 USAGE
@@ -88,6 +92,20 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   SELF_WT=$(git rev-parse --show-toplevel 2>/dev/null)
   [ -n "$SELF_WT" ] && SELF_WT=$(cd "$SELF_WT" 2>/dev/null && pwd -P)
 fi
+
+# git cannot name the top level of a directory it does not recognise, so keep
+# the physical working directory as well. Standing in a broken checkout leaves
+# SELF_WT empty, and that is precisely the case that must survive.
+SELF_PWD=$(pwd -P)
+
+# Whether the shell is standing in the worktree at $1, by either measure.
+standing_in() {
+  local target="$1"
+  [ -n "$SELF_WT" ] && [ "$target" = "$SELF_WT" ] && return 0
+  [ "$target" = "$SELF_PWD" ] && return 0
+  case "$SELF_PWD" in "$target"/*) return 0 ;; esac
+  return 1
+}
 
 # Thread status for a worktree path, as "state|title".
 # Worst case wins: one active thread makes the whole path active.
@@ -172,23 +190,27 @@ for project_dir in "$WORKTREE_ROOT"/*/; do
     title="${info#*|}"
     [ -n "$title" ] || title="${C_DIM}(no thread record)${C_OFF}"
 
+    # The guard chain runs for every worktree, including one git does not
+    # recognise, where the probes that set these never run. Each default is
+    # load-bearing: it has to be the value that keeps its own guard quiet. A
+    # probe whose safe default is not the quiet one needs its own arm on the
+    # orphan path rather than a default here.
     verdict=""
     reason=""
     is_orphan=0
-    orphan_commits=0
+    unreachable_commits=0
     dirty=0
     locked=0
     detached=0
     main_repo=""
 
     if ! git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      # Directory is there but git does not know it: a leftover shell.
+      # Directory is there but git does not know it: a leftover shell, or a
+      # checkout whose .git file has gone. The probes below cannot run, so
+      # their fields keep the neutral values set above and the guard chain
+      # falls through to the checks that need no git.
       is_orphan=1
-      verdict="remove"
-      reason="orphan directory, not a git worktree"
-    fi
-
-    if [ "$is_orphan" -eq 0 ]; then
+    else
       common_dir=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
       main_repo=$(dirname "$common_dir")
 
@@ -206,49 +228,55 @@ for project_dir in "$WORKTREE_ROOT"/*/; do
       detached=0
       git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1 || detached=1
 
-      orphan_commits=0
+      unreachable_commits=0
       if [ "$detached" -eq 1 ]; then
         if [ -z "$(git -C "$wt" for-each-ref --contains HEAD --count=1 --format='%(refname)' 2>/dev/null)" ]; then
-          orphan_commits=1
+          unreachable_commits=1
         fi
       fi
+    fi
 
-      # Ordered by severity: the first match is the reason reported.
-      if [ -n "$SELF_WT" ] && [ "$wt_real" = "$SELF_WT" ]; then
-        verdict="skip"; reason="you are standing in it"
-      elif [ "$state" = "active" ]; then
-        verdict="skip"; reason="thread still active"
-      elif [ "$dirty" -gt 0 ]; then
-        verdict="skip"; reason="$dirty uncommitted change(s)"
-      elif [ "$locked" -eq 1 ]; then
-        verdict="skip"; reason="git worktree is locked"
-      elif [ "$orphan_commits" -eq 1 ] && [ "$FORCE" -eq 0 ]; then
-        verdict="skip"; reason="detached HEAD, commits on no other ref"
-      elif [ "$state" = "unknown" ] && [ "$INCLUDE_UNKNOWN" -eq 0 ]; then
-        verdict="skip"; reason="no thread record (--include-unknown)"
-      else
-        verdict="remove"
-        reason="$state"
-        if [ "$detached" -eq 0 ]; then
-          branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
-          base=$(git -C "$wt" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null)
-          base="${base#origin/}"
-          if [ -z "$base" ]; then
-            for candidate in main master; do
-              if git -C "$wt" rev-parse --verify -q "$candidate" >/dev/null 2>&1; then
-                base="$candidate"; break
-              fi
-            done
-          fi
-          ahead=""
-          [ -n "$base" ] && ahead=$(git -C "$wt" rev-list --count "${base}..HEAD" 2>/dev/null)
-          if [ -n "$ahead" ] && [ "$ahead" -gt 0 ] 2>/dev/null; then
-            reason="$state; branch $branch kept ($ahead commit(s) not in $base)"
-          fi
+    # Ordered by severity: the first match is the reason reported. The chain
+    # runs for an orphan directory too - one the script cannot reason about
+    # earns more care, not less - and the checks it cannot answer without git
+    # sit at their neutral values, so they simply do not fire.
+    if standing_in "$wt_real"; then
+      verdict="skip"; reason="you are standing in it"
+    elif [ "$state" = "active" ]; then
+      verdict="skip"; reason="thread still active"
+    elif [ "$dirty" -gt 0 ]; then
+      verdict="skip"; reason="$dirty uncommitted change(s)"
+    elif [ "$locked" -eq 1 ]; then
+      verdict="skip"; reason="git worktree is locked"
+    elif [ "$unreachable_commits" -eq 1 ] && [ "$FORCE" -eq 0 ]; then
+      verdict="skip"; reason="detached HEAD, commits on no other ref"
+    elif [ "$state" = "unknown" ] && [ "$INCLUDE_UNKNOWN" -eq 0 ]; then
+      verdict="skip"; reason="no thread record (--include-unknown)"
+    elif [ "$is_orphan" -eq 1 ]; then
+      verdict="remove"
+      reason="orphan directory, not a git worktree"
+    else
+      verdict="remove"
+      reason="$state"
+      if [ "$detached" -eq 0 ]; then
+        branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
+        base=$(git -C "$wt" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null)
+        base="${base#origin/}"
+        if [ -z "$base" ]; then
+          for candidate in main master; do
+            if git -C "$wt" rev-parse --verify -q "$candidate" >/dev/null 2>&1; then
+              base="$candidate"; break
+            fi
+          done
         fi
-        if [ "$orphan_commits" -eq 1 ]; then
-          reason="$reason; FORCED, detached commits will be lost"
+        ahead=""
+        [ -n "$base" ] && ahead=$(git -C "$wt" rev-list --count "${base}..HEAD" 2>/dev/null)
+        if [ -n "$ahead" ] && [ "$ahead" -gt 0 ] 2>/dev/null; then
+          reason="$state; branch $branch kept ($ahead commit(s) not in $base)"
         fi
+      fi
+      if [ "$unreachable_commits" -eq 1 ]; then
+        reason="$reason; FORCED, detached commits will be lost"
       fi
     fi
 
@@ -259,7 +287,7 @@ for project_dir in "$WORKTREE_ROOT"/*/; do
       N_REMOVE=$((N_REMOVE + 1))
       REMOVE_KB=$((REMOVE_KB + size_kb))
       colour="$C_GRN"
-      [ "$orphan_commits" -eq 1 ] && colour="$C_RED"
+      [ "$unreachable_commits" -eq 1 ] && colour="$C_RED"
     else
       N_SKIP=$((N_SKIP + 1))
       colour="$C_YEL"
