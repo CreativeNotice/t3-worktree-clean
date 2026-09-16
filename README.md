@@ -12,13 +12,43 @@ dry run unless you pass `--apply`.
 
 ## Install
 
-Put the script anywhere on your `PATH` and make it executable.
+Either option puts the command on your `PATH`. These use `~/.local/bin`, so
+swap in whichever directory you already use.
+
+### Symlink a clone
+
+Pick this if you might read or change the script. The command points at your
+clone, so `git pull` updates it and your own edits take effect immediately.
 
 ```sh
+mkdir -p ~/.local/bin
+git clone https://github.com/CreativeNotice/t3-worktree-clean.git
+ln -s "$PWD/t3-worktree-clean/t3-worktree-clean" ~/.local/bin/t3-worktree-clean
+```
+
+`ln` needs an absolute path, which is what `$PWD` is doing there. A relative
+one gives you a link that breaks the moment you run it from elsewhere. Keep the
+clone somewhere permanent, since deleting it leaves a dead link behind.
+
+### Download the script
+
+Pick this if you just want the command.
+
+```sh
+mkdir -p ~/.local/bin
 curl -o ~/.local/bin/t3-worktree-clean \
   https://raw.githubusercontent.com/CreativeNotice/t3-worktree-clean/main/t3-worktree-clean
 chmod +x ~/.local/bin/t3-worktree-clean
 ```
+
+Then confirm your shell finds it.
+
+```sh
+which t3-worktree-clean
+```
+
+If it finds nothing, that directory is not on your `PATH`. Add it in your shell
+config, for example `export PATH="$HOME/.local/bin:$PATH"` in `~/.zshrc`.
 
 ## Usage
 
