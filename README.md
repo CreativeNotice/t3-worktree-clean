@@ -81,6 +81,41 @@ Dry run. Re-run with --apply to remove them.
 | `--force` | Remove even when detached-HEAD commits would become unreachable. |
 | `-h`, `--help` | Show help. |
 
+## Cleanup reports
+
+Two subcommands help with the rest of the tidy-up after a thread's work has merged. Neither removes a worktree.
+
+### `report`
+
+```sh
+t3-worktree-clean report                       # from inside a T3 worktree
+t3-worktree-clean report --project my-project --threshold 3
+```
+
+It changes nothing. It prints three sections:
+
+1. Every other T3 worktree, in any project, with uncommitted changes, with its branch and the changed files. These belong to other threads, so the report never touches them.
+2. How many of the project's worktrees a dry run would remove. At the threshold (default 5) it lists them. The project defaults to the one the current worktree sits under.
+3. The `prune-branches` dry run for the repo you are in.
+
+### `prune-branches`
+
+```sh
+t3-worktree-clean prune-branches                     # list
+t3-worktree-clean prune-branches --apply             # delete the merged ones
+t3-worktree-clean prune-branches --prefix t3code/    # only these
+```
+
+Removing a worktree leaves its branch behind. This lists local branches that no worktree has checked out, in the repo you run it from, the main checkout or any of its worktrees:
+
+| Mark | Meaning | `--apply` |
+|---|---|---|
+| `merged` | An ancestor of the default branch, so it holds nothing the default branch lacks. | deleted |
+| `gone` | Its upstream was deleted, which is what a host does when a PR completes. Its commits are not on the default branch, as after a squash merge. | kept |
+| `unmerged` | Anything else. | kept |
+
+A `gone` branch is usually safe to delete, but only the host knows whether its PR completed, so check there and delete it yourself with `git branch -D`. `--apply` first runs `git worktree prune`, so a branch whose worktree directory was deleted by hand counts as free. The default branch is never listed. `--prefix` may repeat.
+
 ## How it decides
 
 T3 keeps thread state in `~/.t3/userdata/state.sqlite`. Its `projection_threads`

@@ -25,6 +25,8 @@ PROJECT_FILTER=""
 usage() {
   cat <<'USAGE'
 Usage: t3-worktree-clean [options]
+       t3-worktree-clean report [--project NAME] [--threshold N]
+       t3-worktree-clean prune-branches [--apply] [--prefix P]...
 
 Removes git worktrees left behind by archived or deleted T3 Code threads.
 Prints what it would do and exits unless --apply is given.
@@ -50,8 +52,197 @@ it, so the rest cannot be checked.
 
 Removing a worktree does not delete its branch. Commits on a named branch
 stay reachable and can be checked out again anywhere.
+
+Subcommands:
+  report              Read-only. Lists every other T3 worktree with uncommitted
+                      changes, counts the project's removable worktrees (and
+                      lists them at --threshold, default 5), then runs
+                      prune-branches as a dry run. The project defaults to the
+                      one the current worktree sits under.
+  prune-branches      Lists local branches in the current repo that no worktree
+                      has checked out: merged (an ancestor of the default
+                      branch), gone (upstream deleted, as after a squash-merged
+                      PR) or unmerged. --apply deletes merged ones only, after
+                      pruning worktrees whose directory is gone. --prefix
+                      limits the branches considered, and may repeat.
 USAGE
 }
+
+# ---------------------------------------------------------------------------
+# Subcommands. Each runs and exits before the sweep's option parsing below.
+# ---------------------------------------------------------------------------
+
+# The branch a repo merges into: origin/HEAD if set, else main, else master.
+default_branch() {
+  local repo="$1" b
+  b=$(git -C "$repo" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null)
+  b="${b#origin/}"
+  if [ -n "$b" ] && git -C "$repo" rev-parse --verify -q "refs/heads/$b" >/dev/null; then
+    printf '%s' "$b"; return
+  fi
+  for b in main master; do
+    git -C "$repo" rev-parse --verify -q "refs/heads/$b" >/dev/null && { printf '%s' "$b"; return; }
+  done
+}
+
+# prune-branches [--apply] [--prefix P]...
+#
+# Local branches in the current repo that no worktree has checked out. Only a
+# branch that is an ancestor of the default branch is deleted, and only with
+# --apply. A squash merge leaves a branch's commits off the default branch, so
+# such a branch reads as unmerged here; when its upstream is gone it is marked
+# `gone`, but only the host knows whether its PR completed, so it is kept.
+cmd_prune_branches() {
+  local apply=0 prefixes="" main base checked_out line b track p ahead
+  local n_deleted=0 n_kept=0 n_listed=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1 ;;
+      --prefix)
+        shift
+        [ $# -gt 0 ] || { echo "t3-worktree-clean: --prefix needs a value" >&2; return 2; }
+        prefixes="$prefixes $1"
+        ;;
+      --prefix=*) prefixes="$prefixes ${1#--prefix=}" ;;
+      -h|--help) usage; return 0 ;;
+      *) echo "t3-worktree-clean prune-branches: unknown option '$1'" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  # The main checkout is the first entry, wherever we are standing.
+  main=$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')
+  [ -n "$main" ] || { echo "t3-worktree-clean prune-branches: not in a git repository" >&2; return 2; }
+  base=$(default_branch "$main")
+  [ -n "$base" ] || { echo "t3-worktree-clean prune-branches: no default branch in $main" >&2; return 2; }
+
+  # Forget worktrees whose directory is gone, so their branches count as free.
+  # This changes only git's admin files.
+  [ "$apply" -eq 1 ] && git -C "$main" worktree prune
+
+  checked_out=$(git -C "$main" worktree list --porcelain | sed -n 's|^branch refs/heads/||p')
+
+  while IFS='|' read -r b track; do
+    [ -n "$b" ] || continue
+    [ "$b" = "$base" ] && continue
+    printf '%s\n' "$checked_out" | grep -qxF "$b" && continue
+    if [ -n "$prefixes" ]; then
+      line=0
+      for p in $prefixes; do
+        case "$b" in "$p"*) line=1 ;; esac
+      done
+      [ "$line" -eq 1 ] || continue
+    fi
+    n_listed=$((n_listed + 1))
+
+    if git -C "$main" merge-base --is-ancestor "refs/heads/$b" "refs/heads/$base" 2>/dev/null; then
+      if [ "$apply" -eq 1 ]; then
+        # -D, not -d: -d judges against HEAD or the upstream, and the main
+        # checkout's HEAD need not be the default branch. The ancestry test
+        # above is the proof that nothing is lost.
+        if git -C "$main" branch -D "$b" >/dev/null 2>&1; then
+          echo "deleted  $b"; n_deleted=$((n_deleted + 1))
+        else
+          echo "failed   $b"; n_kept=$((n_kept + 1))
+        fi
+      else
+        echo "merged   $b"
+      fi
+      continue
+    fi
+
+    ahead=$(git -C "$main" rev-list --count "refs/heads/$base..refs/heads/$b" 2>/dev/null)
+    n_kept=$((n_kept + 1))
+    if [ "$track" = "[gone]" ]; then
+      echo "gone     $b ($ahead commit(s) not in $base; upstream deleted)"
+    else
+      echo "unmerged $b ($ahead commit(s) not in $base)"
+    fi
+  done <<BRANCHES
+$(git -C "$main" for-each-ref --format='%(refname:short)|%(upstream:track)' refs/heads/)
+BRANCHES
+
+  [ "$n_listed" -eq 0 ] && echo "none"
+  [ "$apply" -eq 1 ] && echo "Deleted $n_deleted merged branch(es); $n_kept kept."
+  return 0
+}
+
+# report [--project NAME] [--threshold N]
+#
+# Read-only. Dirty worktrees in every project, the project's removable count,
+# and the branch report for the current repo.
+cmd_report() {
+  local project="" threshold=5 here root d changes found=0 dry removable count
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project)
+        shift
+        [ $# -gt 0 ] || { echo "t3-worktree-clean: --project needs a name" >&2; return 2; }
+        project="$1"
+        ;;
+      --project=*) project="${1#--project=}" ;;
+      --threshold)
+        shift
+        case "${1:-}" in ''|*[!0-9]*) echo "t3-worktree-clean: --threshold needs a number" >&2; return 2 ;; esac
+        threshold="$1"
+        ;;
+      -h|--help) usage; return 0 ;;
+      *) echo "t3-worktree-clean report: unknown option '$1'" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  # Physical paths throughout: git reports them, and /tmp is /private/tmp.
+  here=$(git rev-parse --show-toplevel 2>/dev/null)
+  [ -n "$here" ] && here=$(cd "$here" 2>/dev/null && pwd -P)
+  root=$(cd "$WORKTREE_ROOT" 2>/dev/null && pwd -P)
+  if [ -z "$project" ] && [ -n "$root" ] && [ -n "$here" ]; then
+    case "$here" in "$root"/*/*) project="${here#"$root"/}"; project="${project%%/*}" ;; esac
+  fi
+
+  echo "== Other T3 worktrees with uncommitted changes =="
+  for d in "$WORKTREE_ROOT"/*/*/; do
+    [ -e "$d/.git" ] || continue
+    d=$(cd "$d" 2>/dev/null && pwd -P) || continue
+    [ "$d" = "$here" ] && continue
+    changes=$(git -C "$d" status --porcelain 2>/dev/null)
+    [ -n "$changes" ] || continue
+    found=1
+    echo "$d ($(git -C "$d" branch --show-current 2>/dev/null || echo detached))"
+    printf '%s\n' "$changes" | sed 's/^/    /'
+  done
+  [ "$found" -eq 0 ] && echo "none"
+
+  echo
+  if [ -z "$project" ]; then
+    echo "== Archived or deleted worktrees =="
+    echo "not inside a T3 worktree; pass --project NAME"
+  else
+    echo "== Archived or deleted worktrees in $project =="
+    dry=$("$0" --project "$project" 2>&1)
+    removable=$(printf '%s\n' "$dry" | grep -E '^ +[^ ]+ .* remove ')
+    count=$(printf '%s' "$removable" | grep -c .)
+    echo "count: $count (threshold $threshold)"
+    if [ "$count" -ge "$threshold" ]; then
+      echo "An --apply run would remove:"
+      printf '%s\n' "$removable"
+    fi
+  fi
+
+  echo
+  echo "== Branches with no worktree =="
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    cmd_prune_branches
+  else
+    echo "not in a git repository"
+  fi
+  return 0
+}
+
+case "${1:-}" in
+  report) shift; cmd_report "$@"; exit $? ;;
+  prune-branches) shift; cmd_prune_branches "$@"; exit $? ;;
+esac
 
 while [ $# -gt 0 ]; do
   case "$1" in
