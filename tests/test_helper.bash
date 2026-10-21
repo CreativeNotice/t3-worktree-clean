@@ -87,3 +87,82 @@ repo_for() {
 break_checkout() {
   rm -f "$1/.git"
 }
+
+# commit_on <dir> <message> - one empty commit in a checkout.
+commit_on() {
+  git -C "$1" -c user.email=t@example.com -c user.name=t \
+    commit -q --allow-empty -m "$2"
+}
+
+# make_branch <repo> <branch> [commits] - a branch off main with N commits of
+# its own (default 0), never checked out anywhere.
+make_branch() {
+  local repo="$1" branch="$2" n="${3:-0}" i=0
+  git -C "$repo" branch "$branch" main
+  # Not `seq 1 $n`: macOS seq counts down, so `seq 1 0` prints 1 and 0.
+  while [ "$i" -lt "$n" ]; do
+    i=$((i + 1))
+    git -C "$repo" -c user.email=t@example.com -c user.name=t \
+      commit-tree -p "$branch" -m "$branch $i" "$branch^{tree}" \
+      | xargs git -C "$repo" update-ref "refs/heads/$branch"
+  done
+}
+
+# push_then_delete_remote <repo> <branch> - push the branch with tracking to a
+# bare origin, then delete it there and prune, the way a host does once a PR
+# completes. The local branch is left with a gone upstream.
+push_then_delete_remote() {
+  local repo="$1" branch="$2" origin="$BATS_TEST_TMPDIR/origin.git"
+  [ -d "$origin" ] || git init -q --bare "$origin"
+  git -C "$repo" remote get-url origin >/dev/null 2>&1 \
+    || git -C "$repo" remote add origin "$origin"
+  git -C "$repo" push -q -u origin "$branch" 2>/dev/null
+  git -C "$repo" push -q origin --delete "$branch" 2>/dev/null
+  git -C "$repo" fetch -q --prune origin
+}
+
+# Assertions that fail under the bash 3.2 macOS ships. There, a failing [[ ]]
+# fails a test only on its last line, and `! cmd` never fails one, so a case
+# written with either can pass while asserting nothing.
+
+# output_has <s>... - $output contains each string, in the order given.
+output_has() {
+  local rest="$output" s
+  for s in "$@"; do
+    case "$rest" in
+      *"$s"*) rest="${rest#*"$s"}" ;;
+      *) printf 'output lacks "%s" (in order):\n%s\n' "$s" "$output" >&2; return 1 ;;
+    esac
+  done
+}
+
+# output_line <line> - $output has exactly this line. Substring matching is
+# not enough for status words: "merged" is inside "unmerged".
+output_line() {
+  printf '%s\n' "$output" | grep -qxF -- "$1" \
+    || { printf 'no line "%s" in:\n%s\n' "$1" "$output" >&2; return 1; }
+}
+
+# output_lacks <s> - $output does not contain the string.
+output_lacks() {
+  case "$output" in
+    *"$1"*) printf 'output has "%s":\n%s\n' "$1" "$output" >&2; return 1 ;;
+  esac
+  return 0
+}
+
+# branch_exists / branch_missing <repo> <branch>
+branch_exists() {
+  git -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null \
+    || { echo "branch $2 is missing" >&2; return 1; }
+}
+branch_missing() {
+  if git -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null; then
+    echo "branch $2 still exists" >&2; return 1
+  fi
+}
+
+# succeeded - the last `run` exited 0.
+succeeded() {
+  [ "$status" -eq 0 ] || { printf 'exit %s:\n%s\n' "$status" "$output" >&2; return 1; }
+}
