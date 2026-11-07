@@ -15,7 +15,20 @@ set -uo pipefail
 
 T3_ROOT="${T3_ROOT:-$HOME/.t3}"
 WORKTREE_ROOT="$T3_ROOT/worktrees"
-STATE_DB="$T3_ROOT/userdata/state.sqlite"
+# T3 moved thread state to statev2.sqlite and kept state.sqlite, which still
+# answers queries but no longer learns about new threads (#13). Read the old
+# file only on an install that has no statev2.sqlite.
+STATE_DB_V2="$T3_ROOT/userdata/statev2.sqlite"
+STATE_DB_V1="$T3_ROOT/userdata/state.sqlite"
+if [ -f "$STATE_DB_V2" ]; then
+  STATE_DB="$STATE_DB_V2"
+  THREAD_TABLE="orchestration_v2_projection_threads"
+  THREAD_PATH="json_extract(payload_json, '$.worktreePath')"
+else
+  STATE_DB="$STATE_DB_V1"
+  THREAD_TABLE="projection_threads"
+  THREAD_PATH="worktree_path"
+fi
 
 APPLY=0
 FORCE=0
@@ -316,8 +329,8 @@ thread_info() {
       END
       || '|' ||
       COALESCE(MAX(title), '')
-    FROM projection_threads
-    WHERE worktree_path = '${escaped}';" 2>/dev/null || printf 'unknown|'
+    FROM ${THREAD_TABLE}
+    WHERE ${THREAD_PATH} = '${escaped}';" 2>/dev/null || printf 'unknown|'
 }
 
 human_size() {
