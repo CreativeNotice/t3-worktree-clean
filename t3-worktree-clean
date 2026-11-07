@@ -20,14 +20,34 @@ WORKTREE_ROOT="$T3_ROOT/worktrees"
 # file only on an install that has no statev2.sqlite.
 STATE_DB_V2="$T3_ROOT/userdata/statev2.sqlite"
 STATE_DB_V1="$T3_ROOT/userdata/state.sqlite"
+#
+# THREAD_ROWS is a printf format: given the escaped worktree path, it selects
+# one row per thread on that path with its title, whether it is a subagent,
+# and the archived_at and deleted_at that decide it.
+#
+# T3 starts subagent threads for review and research runs on the same
+# worktree as the thread that started them, and does not archive them with
+# it (#15). A subagent therefore counts as finished when it or its root
+# thread is. A subagent whose root is not in the database stays active.
 if [ -f "$STATE_DB_V2" ]; then
   STATE_DB="$STATE_DB_V2"
-  THREAD_TABLE="orchestration_v2_projection_threads"
-  THREAD_PATH="json_extract(payload_json, '$.worktreePath')"
+  THREAD_ROWS="
+    SELECT c.title AS title,
+      json_extract(c.payload_json, '$.lineage.relationshipToParent') IS 'subagent' AS sub,
+      CASE WHEN json_extract(c.payload_json, '$.lineage.relationshipToParent') IS 'subagent'
+        THEN COALESCE(c.archived_at, r.archived_at) ELSE c.archived_at END AS archived_at,
+      CASE WHEN json_extract(c.payload_json, '$.lineage.relationshipToParent') IS 'subagent'
+        THEN COALESCE(c.deleted_at, r.deleted_at) ELSE c.deleted_at END AS deleted_at
+    FROM orchestration_v2_projection_threads c
+    LEFT JOIN orchestration_v2_projection_threads r
+      ON r.thread_id = json_extract(c.payload_json, '$.lineage.rootThreadId')
+    WHERE json_extract(c.payload_json, '$.worktreePath') = '%s'"
 else
   STATE_DB="$STATE_DB_V1"
-  THREAD_TABLE="projection_threads"
-  THREAD_PATH="worktree_path"
+  THREAD_ROWS="
+    SELECT title, 0 AS sub, archived_at, deleted_at
+    FROM projection_threads
+    WHERE worktree_path = '%s'"
 fi
 
 APPLY=0
@@ -312,11 +332,16 @@ standing_in() {
 }
 
 # Thread status for a worktree path, as "state|title".
-# Worst case wins: one active thread makes the whole path active.
+# Worst case wins: one active thread makes the whole path active. The title is
+# a root thread's where there is one, since a subagent's names only its run.
 thread_info() {
-  local path="$1" escaped
+  local path="$1" escaped rows
   [ "$HAVE_DB" -eq 1 ] || { printf 'unknown|'; return; }
   escaped=$(printf '%s' "$path" | sed "s/'/''/g")
+  # The path goes in as a printf argument, never into the format, so a % in
+  # it is taken literally.
+  # shellcheck disable=SC2059
+  rows=$(printf "$THREAD_ROWS" "$escaped")
   sqlite3 -readonly "file:${STATE_DB}?mode=ro" "
     SELECT
       CASE
@@ -328,9 +353,8 @@ thread_info() {
         ELSE 'archived'
       END
       || '|' ||
-      COALESCE(MAX(title), '')
-    FROM ${THREAD_TABLE}
-    WHERE ${THREAD_PATH} = '${escaped}';" 2>/dev/null || printf 'unknown|'
+      COALESCE(MAX(CASE WHEN sub THEN NULL ELSE title END), MAX(title), '')
+    FROM (${rows});" 2>/dev/null || printf 'unknown|'
 }
 
 human_size() {

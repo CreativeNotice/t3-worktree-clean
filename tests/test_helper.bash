@@ -55,17 +55,50 @@ state_sql() {
   esac
 }
 
-# add_thread <project> <name> <active|archived|deleted> <title>
-# A thread in statev2.sqlite, the database T3 uses now.
+# add_thread <project> <name> <active|archived|deleted> <title> [id]
+# A root thread in statev2.sqlite, the database T3 uses now. Pass an id when a
+# subagent will name this thread as its root.
 add_thread() {
-  local project="$1" name="$2" state="$3" title="$4" cols
+  local project="$1" name="$2" state="$3" title="$4" id="${5:-$2-$RANDOM$RANDOM}"
+  insert_v2_thread "$project" "$name" "$state" "$title" "$id" \
+    "json_object('parentThreadId', NULL, 'relationshipToParent', NULL,
+                 'rootThreadId', '$(sq "$id")')"
+}
+
+# add_subagent <project> <name> <state> <title> <root-id> [parent-id] [id]
+# A subagent thread, the kind T3 starts for a review or research run. It
+# shares its root's worktree and records the root in its lineage. The parent
+# defaults to the root; name another subagent to nest one.
+add_subagent() {
+  local project="$1" name="$2" state="$3" title="$4" root="$5"
+  local parent="${6:-$5}" id="${7:-sub-$RANDOM$RANDOM}"
+  insert_v2_thread "$project" "$name" "$state" "$title" "$id" \
+    "json_object('parentThreadId', '$(sq "$parent")',
+                 'relationshipToParent', 'subagent',
+                 'rootThreadId', '$(sq "$root")')"
+}
+
+# add_fork <project> <name> <state> <title> <root-id>
+# A thread forked from another, which the user starts and drives themselves.
+add_fork() {
+  local project="$1" name="$2" state="$3" title="$4" root="$5"
+  insert_v2_thread "$project" "$name" "$state" "$title" "fork-$RANDOM$RANDOM" \
+    "json_object('parentThreadId', '$(sq "$root")',
+                 'relationshipToParent', 'fork',
+                 'rootThreadId', '$(sq "$root")')"
+}
+
+# insert_v2_thread <project> <name> <state> <title> <id> <lineage-sql>
+insert_v2_thread() {
+  local project="$1" name="$2" state="$3" title="$4" id="$5" lineage="$6" cols
   cols=$(state_sql "$state") || return 1
   sqlite3 "$T3_ROOT/userdata/statev2.sqlite" \
     "INSERT INTO orchestration_v2_projection_threads
        (thread_id, title, archived_at, deleted_at, payload_json)
-     VALUES ('$name-$RANDOM$RANDOM', '$(sq "$title")', $cols,
+     VALUES ('$(sq "$id")', '$(sq "$title")', $cols,
        json_object('title', '$(sq "$title")',
-                   'worktreePath', '$(sq "$(wt_path "$project" "$name")")'));"
+                   'worktreePath', '$(sq "$(wt_path "$project" "$name")")',
+                   'lineage', json($lineage)));"
 }
 
 # add_legacy_thread <project> <name> <active|archived|deleted> <title>

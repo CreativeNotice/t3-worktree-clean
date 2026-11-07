@@ -125,6 +125,14 @@ in `payload_json`. A worktree whose thread is archived or deleted, while its
 directory is still on disk, is a leftover. T3's "settled" state does not count:
 a settled thread that is not archived is still active.
 
+Several threads can share a worktree. When a thread runs a review or a
+research task, T3 starts a subagent thread on the same worktree and records
+the starting thread as its root (`lineage.rootThreadId`). Archiving the root
+does not archive its subagents, so a subagent counts as finished when either
+it or its root is archived or deleted. A subagent whose root is missing from
+the database stays active. A forked thread is one you drive yourself, so it
+counts on its own. The table shows the root thread's title.
+
 Older T3 releases kept the same facts in `state.sqlite`, table
 `projection_threads`, column `worktree_path`. Current T3 leaves that file in
 place, but it no longer learns about new threads, so the script reads it only
