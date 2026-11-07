@@ -23,13 +23,15 @@ setup_t3() {
     return 1
   fi
 
-  sqlite3 "$T3_ROOT/userdata/state.sqlite" \
-    'CREATE TABLE projection_threads (
-       id            TEXT,
-       title         TEXT,
-       worktree_path TEXT,
+  # The database T3 reads and writes today. The worktree path lives in the
+  # JSON payload, not in a column.
+  sqlite3 "$T3_ROOT/userdata/statev2.sqlite" \
+    'CREATE TABLE orchestration_v2_projection_threads (
+       thread_id     TEXT PRIMARY KEY,
+       title         TEXT NOT NULL,
        archived_at   TEXT,
-       deleted_at    TEXT
+       deleted_at    TEXT,
+       payload_json  TEXT NOT NULL
      );'
 }
 
@@ -38,19 +40,55 @@ wt_path() {
   printf '%s' "$T3_ROOT/worktrees/$1/$2"
 }
 
-# add_thread <project> <name> <active|archived|deleted> <title>
-add_thread() {
-  local project="$1" name="$2" state="$3" title="$4"
-  local archived="NULL" deleted="NULL"
-  case "$state" in
-    active) ;;
-    archived) archived="'2026-01-01T00:00:00Z'" ;;
-    deleted) deleted="'2026-01-01T00:00:00Z'" ;;
-    *) echo "add_thread: unknown state '$state'" >&2; return 1 ;;
+# sq <s> - the string with each single quote doubled, for a SQL literal.
+sq() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
+# state_sql <state> - the archived_at and deleted_at values for a thread state.
+state_sql() {
+  case "$1" in
+    active) printf 'NULL, NULL' ;;
+    archived) printf "'2026-01-01T00:00:00Z', NULL" ;;
+    deleted) printf "NULL, '2026-01-01T00:00:00Z'" ;;
+    *) echo "unknown thread state '$1'" >&2; return 1 ;;
   esac
+}
+
+# add_thread <project> <name> <active|archived|deleted> <title>
+# A thread in statev2.sqlite, the database T3 uses now.
+add_thread() {
+  local project="$1" name="$2" state="$3" title="$4" cols
+  cols=$(state_sql "$state") || return 1
+  sqlite3 "$T3_ROOT/userdata/statev2.sqlite" \
+    "INSERT INTO orchestration_v2_projection_threads
+       (thread_id, title, archived_at, deleted_at, payload_json)
+     VALUES ('$name-$RANDOM$RANDOM', '$(sq "$title")', $cols,
+       json_object('title', '$(sq "$title")',
+                   'worktreePath', '$(sq "$(wt_path "$project" "$name")")'));"
+}
+
+# add_legacy_thread <project> <name> <active|archived|deleted> <title>
+# A thread in state.sqlite, the database T3 used before statev2.sqlite.
+add_legacy_thread() {
+  local project="$1" name="$2" state="$3" title="$4" cols
+  cols=$(state_sql "$state") || return 1
+  sqlite3 "$T3_ROOT/userdata/state.sqlite" \
+    'CREATE TABLE IF NOT EXISTS projection_threads (
+       id            TEXT,
+       title         TEXT,
+       worktree_path TEXT,
+       archived_at   TEXT,
+       deleted_at    TEXT
+     );'
   sqlite3 "$T3_ROOT/userdata/state.sqlite" \
     "INSERT INTO projection_threads (id, title, worktree_path, archived_at, deleted_at)
-     VALUES ('$name', '$title', '$(wt_path "$project" "$name")', $archived, $deleted);"
+     VALUES ('$name', '$(sq "$title")', '$(sq "$(wt_path "$project" "$name")")', $cols);"
+}
+
+# drop_v2_db - an older T3 install, with no statev2.sqlite.
+drop_v2_db() {
+  rm -f "$T3_ROOT/userdata/statev2.sqlite"
 }
 
 # make_orphan <project> <name> - a plain directory git knows nothing about.

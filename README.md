@@ -118,10 +118,17 @@ A `gone` branch is usually safe to delete, but only the host knows whether its P
 
 ## How it decides
 
-T3 keeps thread state in `~/.t3/userdata/state.sqlite`. Its `projection_threads`
-table maps each thread to a `worktree_path` and records `archived_at` and
-`deleted_at`. A worktree whose thread is archived or deleted, while its
-directory is still on disk, is a leftover.
+T3 keeps thread state in `~/.t3/userdata/statev2.sqlite`. Its
+`orchestration_v2_projection_threads` table records `archived_at` and
+`deleted_at` for each thread, with the thread's worktree path at `worktreePath`
+in `payload_json`. A worktree whose thread is archived or deleted, while its
+directory is still on disk, is a leftover. T3's "settled" state does not count:
+a settled thread that is not archived is still active.
+
+Older T3 releases kept the same facts in `state.sqlite`, table
+`projection_threads`, column `worktree_path`. Current T3 leaves that file in
+place, but it no longer learns about new threads, so the script reads it only
+when `statev2.sqlite` does not exist.
 
 The script reads that database with `sqlite3 -readonly`, so it never writes to
 T3's state.
